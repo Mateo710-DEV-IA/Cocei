@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+coverage/
+*.tsbuildinfo
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.p12
+credentials*.json
+token*.json
+
+# Logs / OS
+logs/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Local artifacts
+tmp_*.xlsx
+trazabilidad_*.zip
+*.eml
+
+# Nest / test
+/.nyc_output
