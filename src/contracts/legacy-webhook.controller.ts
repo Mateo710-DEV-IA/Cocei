@@ -2,6 +2,8 @@ import {
   BadRequestException,
   Body,
   Controller,
+  HttpCode,
+  Logger,
   Post,
   Req,
   Res,
@@ -20,9 +22,12 @@ import { ContractsActionsService } from './services/contracts-actions.service';
  */
 @Controller('webhook')
 export class LegacyWebhookController {
+  private readonly logger = new Logger(LegacyWebhookController.name);
+
   constructor(private readonly actions: ContractsActionsService) {}
 
   @Post('48a8c68c-2953-4728-a57c-8e0ba0ccec0f')
+  @HttpCode(200)
   @UseInterceptors(
     FileFieldsInterceptor(
       [
@@ -52,21 +57,40 @@ export class LegacyWebhookController {
     @UploadedFiles()
     files: { file?: Express.Multer.File[]; pdf_file?: Express.Multer.File[] },
   ) {
-    return this.actions.uploadPdf(body, files);
+    this.logger.log(
+      `[HTTP_HIT] POST /webhook/48a8c68c-2953-4728-a57c-8e0ba0ccec0f (upload PHP)`,
+    );
+    return this.actions.uploadPdf(
+      body,
+      files,
+      '/webhook/48a8c68c-2953-4728-a57c-8e0ba0ccec0f',
+    );
   }
 
   @Post('start_process_automation')
+  @HttpCode(200)
   processLegacy(@Req() req: Request) {
-    return this.actions.processContract(req);
+    this.logger.log(`[HTTP_HIT] POST /webhook/start_process_automation`);
+    return this.actions.processContract(req, '/webhook/start_process_automation');
   }
 
   @Post('cancel_process_automation')
+  @HttpCode(200)
   cancelLegacy(@Req() req: Request) {
-    return this.actions.cancelContract(req);
+    this.logger.log(`[HTTP_HIT] POST /webhook/cancel_process_automation`);
+    return this.actions.cancelContract(req, '/webhook/cancel_process_automation');
   }
 
   @Post('342591cc-8617-440d-b649-b2562c780490')
+  @HttpCode(200)
   downloadLegacy(@Req() req: Request, @Res() res: Response) {
-    return this.actions.downloadTraceability(req, res);
+    this.logger.log(
+      `[HTTP_HIT] POST /webhook/342591cc-8617-440d-b649-b2562c780490 (traceability)`,
+    );
+    return this.actions.downloadTraceability(
+      req,
+      res,
+      '/webhook/342591cc-8617-440d-b649-b2562c780490',
+    );
   }
 }

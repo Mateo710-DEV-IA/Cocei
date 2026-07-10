@@ -2,6 +2,8 @@ import {
   BadRequestException,
   Body,
   Controller,
+  HttpCode,
+  Logger,
   Post,
   Req,
   Res,
@@ -16,9 +18,12 @@ import { ContractsActionsService } from './services/contracts-actions.service';
 
 @Controller('contracts')
 export class ContractsController {
+  private readonly logger = new Logger(ContractsController.name);
+
   constructor(private readonly actions: ContractsActionsService) {}
 
   @Post('upload-pdf')
+  @HttpCode(200)
   @UseInterceptors(
     FileFieldsInterceptor(
       [
@@ -48,21 +53,32 @@ export class ContractsController {
     @UploadedFiles()
     files: { file?: Express.Multer.File[]; pdf_file?: Express.Multer.File[] },
   ) {
-    return this.actions.uploadPdf(body, files);
+    this.logger.log(`[HTTP_HIT] POST /contracts/upload-pdf`);
+    return this.actions.uploadPdf(body, files, '/contracts/upload-pdf');
   }
 
   @Post('process')
+  @HttpCode(200)
   processContract(@Req() req: Request) {
-    return this.actions.processContract(req);
+    this.logger.log(`[HTTP_HIT] POST /contracts/process`);
+    return this.actions.processContract(req, '/contracts/process');
   }
 
   @Post('cancel')
+  @HttpCode(200)
   cancelContract(@Req() req: Request) {
-    return this.actions.cancelContract(req);
+    this.logger.log(`[HTTP_HIT] POST /contracts/cancel`);
+    return this.actions.cancelContract(req, '/contracts/cancel');
   }
 
   @Post('traceability/download')
+  @HttpCode(200)
   downloadTraceability(@Req() req: Request, @Res() res: Response) {
-    return this.actions.downloadTraceability(req, res);
+    this.logger.log(`[HTTP_HIT] POST /contracts/traceability/download`);
+    return this.actions.downloadTraceability(
+      req,
+      res,
+      '/contracts/traceability/download',
+    );
   }
 }
