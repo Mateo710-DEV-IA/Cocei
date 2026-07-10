@@ -35,11 +35,11 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     }
 
     const intervalMs = Number(
-      this.configService.get<string>('GMAIL_DETECT_INTERVAL_MS', '15000'),
+      this.configService.get<string>('GMAIL_DETECT_INTERVAL_MS', '60000'),
     );
     const safeInterval = Number.isFinite(intervalMs)
-      ? Math.max(5000, intervalMs)
-      : 15000;
+      ? Math.max(15000, intervalMs)
+      : 60000;
     const delayRange = this.getReplyDelayRangeMs();
 
     this.logger.log(
