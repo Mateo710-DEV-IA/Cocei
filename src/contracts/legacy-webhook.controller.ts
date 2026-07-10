@@ -10,7 +10,10 @@ import {
   UploadedFiles,
   UseInterceptors,
 } from '@nestjs/common';
-import { FileFieldsInterceptor } from '@nestjs/platform-express';
+import {
+  FileFieldsInterceptor,
+  NoFilesInterceptor,
+} from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import type { Request, Response } from 'express';
 import { isPdfUpload } from './cocei-compat';
@@ -69,6 +72,7 @@ export class LegacyWebhookController {
 
   @Post('start_process_automation')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   processLegacy(@Req() req: Request) {
     this.logger.log(`[HTTP_HIT] POST /webhook/start_process_automation`);
     return this.actions.processContract(req, '/webhook/start_process_automation');
@@ -76,6 +80,7 @@ export class LegacyWebhookController {
 
   @Post('cancel_process_automation')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   cancelLegacy(@Req() req: Request) {
     this.logger.log(`[HTTP_HIT] POST /webhook/cancel_process_automation`);
     return this.actions.cancelContract(req, '/webhook/cancel_process_automation');
@@ -83,6 +88,7 @@ export class LegacyWebhookController {
 
   @Post('342591cc-8617-440d-b649-b2562c780490')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   downloadLegacy(@Req() req: Request, @Res() res: Response) {
     this.logger.log(
       `[HTTP_HIT] POST /webhook/342591cc-8617-440d-b649-b2562c780490 (traceability)`,

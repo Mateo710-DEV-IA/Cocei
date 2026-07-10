@@ -10,7 +10,10 @@ import {
   UploadedFiles,
   UseInterceptors,
 } from '@nestjs/common';
-import { FileFieldsInterceptor } from '@nestjs/platform-express';
+import {
+  FileFieldsInterceptor,
+  NoFilesInterceptor,
+} from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
 import type { Request, Response } from 'express';
 import { isPdfUpload } from './cocei-compat';
@@ -59,6 +62,7 @@ export class ContractsController {
 
   @Post('process')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   processContract(@Req() req: Request) {
     this.logger.log(`[HTTP_HIT] POST /contracts/process`);
     return this.actions.processContract(req, '/contracts/process');
@@ -66,6 +70,7 @@ export class ContractsController {
 
   @Post('cancel')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   cancelContract(@Req() req: Request) {
     this.logger.log(`[HTTP_HIT] POST /contracts/cancel`);
     return this.actions.cancelContract(req, '/contracts/cancel');
@@ -73,6 +78,7 @@ export class ContractsController {
 
   @Post('traceability/download')
   @HttpCode(200)
+  @UseInterceptors(NoFilesInterceptor())
   downloadTraceability(@Req() req: Request, @Res() res: Response) {
     this.logger.log(`[HTTP_HIT] POST /contracts/traceability/download`);
     return this.actions.downloadTraceability(
