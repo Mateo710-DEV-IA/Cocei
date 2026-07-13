@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { Request, Response } from 'express';
+import { SystemErrorService } from '../../common/system-error.service';
 import {
   buildUploadPdfResponse,
   pickUploadedPdf,
@@ -12,6 +13,7 @@ import {
 } from '../cocei-compat';
 import { GoogleWorkspaceService } from './google-workspace.service';
 import { ContractProcessService } from './contract-process.service';
+import { SqlService } from './sql.service';
 
 type UploadedPdfFields = {
   file?: Express.Multer.File[];
@@ -26,6 +28,8 @@ export class ContractsActionsService {
     private readonly googleService: GoogleWorkspaceService,
     private readonly processService: ContractProcessService,
     private readonly configService: ConfigService,
+    private readonly sqlService: SqlService,
+    private readonly systemErrorService: SystemErrorService,
   ) {}
 
   async uploadPdf(
@@ -118,14 +122,58 @@ export class ContractsActionsService {
         throw error;
       }
 
+      // Validación rápida (SQL): si el folio no existe, PHP recibe 4xx.
+      // PHP en start_process solo exige HTTP 2xx; no parsea el body.
+      const data = await this.sqlService.getContractByFolio(folioDigital);
+      if (Number(data.contrato.is_cancelado || 0) === 1) {
+        const cancelled = {
+          ok: true,
+          folio_digital: folioDigital,
+          id_contrato: data.contrato.id_contrato,
+          cancelled: true,
+          status: 'cancelled',
+          message:
+            'El proceso ya fue cancelado para este folio. No se generan OT/OS ni nuevos envios.',
+        };
+        this.logger.log(
+          `[ENDPOINT_OK] route=${routeLabel} action=process folio=${folioDigital} cancelled=true`,
+        );
+        return cancelled;
+      }
+
       this.logger.log(
-        `[ENDPOINT_STEP] route=${routeLabel} action=process folio=${folioDigital} consultando_sql_y_generando_OT_OS`,
+        `[ENDPOINT_STEP] route=${routeLabel} action=process folio=${folioDigital} accepted_background_OT_OS`,
       );
-      const result = await this.processService.processByFolio(folioDigital);
-      this.logger.log(
-        `[ENDPOINT_OK] route=${routeLabel} action=process folio=${folioDigital} cancelled=${Boolean((result as { cancelled?: boolean }).cancelled)}`,
-      );
-      return result;
+
+      // Respuesta inmediata (HTTP 200) para no romper CURLOPT_TIMEOUT=30 de PHP.
+      // OT/OS corre en background; fallos → logs + tab_errores.
+      void this.processService
+        .processByFolio(folioDigital)
+        .then((result) => {
+          this.logger.log(
+            `[ENDPOINT_OK] route=${routeLabel} action=process folio=${folioDigital} mode=background cancelled=${Boolean((result as { cancelled?: boolean }).cancelled)}`,
+          );
+        })
+        .catch(async (error: unknown) => {
+          const message = (error as Error)?.message || String(error);
+          this.logger.error(
+            `[ENDPOINT_FAIL] route=${routeLabel} action=process folio=${folioDigital} mode=background reason=${message}`,
+          );
+          await this.systemErrorService.notify({
+            error,
+            folioDigital,
+            context: `processContract background route=${routeLabel}`,
+            source: 'contracts-actions.process',
+          });
+        });
+
+      return {
+        ok: true,
+        folio_digital: folioDigital,
+        id_contrato: data.contrato.id_contrato,
+        status: 'accepted',
+        message: 'Proceso de automatizacion iniciado',
+      };
     } catch (error) {
       this.logger.error(
         `[ENDPOINT_FAIL] route=${routeLabel} action=process reason=${(error as Error).message}`,
@@ -173,31 +221,23 @@ export class ContractsActionsService {
     res: Response,
     routeLabel = 'traceability/download',
   ) {
-    const body = (req.body || {}) as Record<string, unknown>;
-    const bodyKeys = Object.keys(body);
+    const body = req.body as unknown;
+    const bodyKeys = Array.isArray(body)
+      ? [`[array:${body.length}]`]
+      : Object.keys((body as Record<string, unknown>) || {});
     this.logger.log(
       `[ENDPOINT_IN] route=${routeLabel} action=traceability method=${req.method} bodyKeys=${bodyKeys.join(',') || '(none)'}`,
     );
 
     try {
-      const folioDigital =
-        typeof body.folio_digital === 'string' ? body.folio_digital.trim() : '';
-      const foliosInput = Array.isArray(body.folios) ? body.folios : [];
-
-      const folios = Array.from(
-        new Set(
-          [folioDigital, ...foliosInput]
-            .map((item) => String(item || '').trim())
-            .filter((item) => item.length > 0),
-        ),
-      );
+      const folios = this.parseTraceabilityFolios(body);
 
       if (!folios.length) {
         this.logger.warn(
           `[ENDPOINT_STOP] route=${routeLabel} action=traceability reason=sin_folios`,
         );
         throw new BadRequestException(
-          'Debes enviar folio_digital o folios para descargar trazabilidad.',
+          'Debes enviar folio_digital, folios, o un arreglo [{ folio_digital }] para descargar trazabilidad.',
         );
       }
 
@@ -228,5 +268,50 @@ export class ContractsActionsService {
       );
       throw error;
     }
+  }
+
+  /**
+   * Acepta:
+   * - [{ "folio_digital": "..." }, ...]
+   * - { "folio_digital": "..." }
+   * - { "folios": ["...", ...] }
+   * - { "folios": [{ "folio_digital": "..." }, ...] }
+   */
+  private parseTraceabilityFolios(body: unknown): string[] {
+    const collected: string[] = [];
+
+    const pushFolio = (value: unknown) => {
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed) {
+          collected.push(trimmed);
+        }
+        return;
+      }
+      if (value && typeof value === 'object' && 'folio_digital' in value) {
+        const folio = String(
+          (value as { folio_digital?: unknown }).folio_digital ?? '',
+        ).trim();
+        if (folio) {
+          collected.push(folio);
+        }
+      }
+    };
+
+    if (Array.isArray(body)) {
+      for (const item of body) {
+        pushFolio(item);
+      }
+    } else if (body && typeof body === 'object') {
+      const obj = body as Record<string, unknown>;
+      pushFolio(obj.folio_digital);
+      if (Array.isArray(obj.folios)) {
+        for (const item of obj.folios) {
+          pushFolio(item);
+        }
+      }
+    }
+
+    return Array.from(new Set(collected));
   }
 }

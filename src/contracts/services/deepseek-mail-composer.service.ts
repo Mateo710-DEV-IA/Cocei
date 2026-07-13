@@ -81,11 +81,11 @@ export class DeepseekMailComposerService {
         const content = await this.callCursorAnthropic({
           apiKey,
           model,
-          temperature: 0.45,
+          temperature: 0.55,
           systemPrompt:
-            'Eres especialista en redaccion de correos mexicanos naturales. El cuerpo debe ir en parrafos corridos, sin saltos de linea por ancho fijo. Responde SOLO JSON valido con llaves "subject" y "message".',
+            'Redactas correos operativos cortos en espanol mexicano. El cuerpo va corrido, sin saltos de linea. Responde SOLO JSON con llaves "subject" y "message".',
           userPrompt: prompt,
-          maxTokens: 900,
+          maxTokens: 350,
         });
         const parsed = this.parseModelJson(content);
 
@@ -95,10 +95,8 @@ export class DeepseekMailComposerService {
         const normalizedMessage = this.validateGeneratedMessage({
           rawMessage: parsed.message,
           structure: profile.estructura,
-          summaryContext: params.summaryContext,
-          sourceExcerpt: params.sourceExcerpt,
           service: params.service,
-          folio: params.folio,
+          docType: params.docType,
         });
 
         const signature = this.createSignature(parsed.subject, normalizedMessage);
@@ -447,49 +445,34 @@ export class DeepseekMailComposerService {
           .join('\n')
       : 'REGLAS QUE FALLARON EN INTENTOS PREVIOS: ninguna.';
 
+    const docLabel =
+      params.docType === 'OT' ? 'orden de trabajo (OT)' : 'orden de servicio (OS)';
+    const roleHint =
+      params.recipientRole === 'integradora'
+        ? 'Destinatario: integradora.'
+        : 'Destinatario: ejecutora.';
+
     return [
-      'Eres una persona que debe escribir un correo en espanol.',
-      `Tipo de documento: ${params.docType}`,
-      `Folio: ${params.folio}`,
-      `Destinatario principal: cuenta ${params.recipientRole}`,
-      `Semilla de variacion obligatoria: ${variationSeed}`,
+      'Redacta un correo CORTO y al punto (2 a 4 oraciones como maximo).',
+      `Documento adjunto: ${docLabel}`,
+      roleHint,
+      `Servicio (usar exactamente este nombre de base de datos): ${params.service || 'servicio solicitado'}`,
+      `Semilla de variacion: ${variationSeed}`,
+      `Tono sugerido: ${profile.tono_general}. Apertura sugerida: "${profile.apertura}".`,
       '',
-      'TU PERFIL GENERADO ALEATORIAMENTE:',
-      `- Rol: ${profile.perfil}`,
-      `- Estilo: ${profile.estilo_escritura}`,
-      `- Tono: ${profile.tono_general} (${profile.expresiones_clave})`,
-      `- Como abre: "${profile.apertura}"`,
-      `- Estructura: ${profile.estructura}`,
-      `- Extension esperada: ${profile.largo_esperado}`,
-      `- Naturalidad: ${profile.naturalidad} (${profile.tips_naturalidad})`,
+      'DEBE incluir, con redaccion natural (no plantilla fija):',
+      `1) Que se hace llegar la ${docLabel}.`,
+      '2) Que corresponde a la solicitud del servicio indicado arriba.',
+      '3) Que se espera su ejecucion.',
       '',
-      'SERVICIO A SOLICITAR:',
-      params.service || '(sin servicio)',
-      '',
-      'OBSERVACIONES:',
-      params.observations || '(sin observaciones)',
-      '',
-      'RESUMEN INTELIGENTE DEL DOCUMENTO FUENTE:',
-      params.summaryContext || '(sin resumen)',
-      '',
-      'EXTRACTO TEXTUAL DEL PDF (fuente primaria):',
-      params.sourceExcerpt || '(sin extracto)',
-      '',
-      'INSTRUCCIONES:',
-      '1) Escribe como el perfil indicado.',
-      '2) Mantener tono mexicano natural, como lo haria una persona real.',
-      '3) Subject corto y neutro. No incluir folio ni codigos.',
-      '4) Debe ser diferente en redaccion para OT y OS.',
-      '5) Incluye instrucciones claras segun el rol destinatario.',
-      '6) Objetivo obligatorio: solicitar el servicio detectado en el contrato.',
-      '7) Usa SOLO informacion del resumen y del extracto textual. PROHIBIDO inventar datos.',
-      '8) NO menciones fechas de contrato, precios, montos, vigencias, clausulas ni terminos legales sospechosos.',
-      '9) NO menciones folio, OT, OS, numero de contrato ni codigos internos.',
-      '10) El campo message debe ser UN SOLO texto corrido, sin ningun salto de linea (\\n). Como un parrafo normal de Gmail.',
-      '11) PROHIBIDO formatear por ancho, PROHIBIDO cortar oraciones en renglones, PROHIBIDO poner Enter dentro del message.',
-      '12) Si un dato no aparece en el PDF, indica "no especificado en documento".',
-      '13) No uses texto generico repetitivo.',
-      '14) Responde SOLO JSON: {"subject":"...","message":"..."}',
+      'REGLAS:',
+      '- Espanol mexicano, claro y profesional.',
+      '- Variar la redaccion; no copies una frase fija.',
+      '- NO inventes montos, fechas, clausulas ni datos extra.',
+      '- NO incluyas el folio ni codigos internos en el cuerpo.',
+      '- message = UN SOLO texto corrido, sin saltos de linea.',
+      '- subject corto y neutro, sin folio.',
+      '- Responde SOLO JSON: {"subject":"...","message":"..."}',
       '',
       correctionSection,
     ].join('\n');
@@ -498,10 +481,8 @@ export class DeepseekMailComposerService {
   private validateGeneratedMessage(params: {
     rawMessage: string;
     structure: string;
-    summaryContext: string;
-    sourceExcerpt: string;
     service: string;
-    folio: string;
+    docType: MailDocType;
   }): string {
     const normalizedMessage = this.normalizeGeneratedMessage(
       params.rawMessage,
@@ -510,27 +491,21 @@ export class DeepseekMailComposerService {
     if (!this.hasValidParagraphShape(normalizedMessage)) {
       throw new Error('La redaccion no tiene forma natural de parrafos.');
     }
+    if (normalizedMessage.length > 700) {
+      throw new Error('El mensaje es demasiado largo; debe ser corto y al punto.');
+    }
     const cleanedMessage = this.stripSuspiciousDetails(normalizedMessage);
     if (this.containsSuspiciousDetails(cleanedMessage)) {
       throw new Error('Incluye informacion sospechosa no permitida.');
     }
-    if (
-      !this.isGroundedToSource(
-        cleanedMessage,
-        params.summaryContext,
-        params.sourceExcerpt,
-      )
-    ) {
-      throw new Error('No esta suficientemente anclado al contenido del PDF.');
-    }
     if (!this.referencesRequestedService(cleanedMessage, params.service)) {
       throw new Error('No hace referencia suficientemente clara al servicio.');
     }
-    if (!this.hasRequestIntent(cleanedMessage)) {
-      throw new Error('No expresa claramente la solicitud del servicio.');
+    if (!this.referencesDocumentType(cleanedMessage, params.docType)) {
+      throw new Error('No menciona la orden de trabajo/servicio enviada.');
     }
-    if (this.containsForbiddenOperationalReferences(cleanedMessage, params.folio)) {
-      throw new Error('Incluye referencias operativas prohibidas (folio/OT/OS/codigos).');
+    if (!this.hasExecutionExpectation(cleanedMessage)) {
+      throw new Error('No indica que se espera la ejecucion.');
     }
     return cleanedMessage;
   }
@@ -547,17 +522,15 @@ export class DeepseekMailComposerService {
     },
     profile: MailProfile,
   ): { subject: string; message: string } {
-    const subject = `${params.folio}-${params.docType}`;
+    const subject =
+      params.docType === 'OT' ? 'Orden de trabajo' : 'Orden de servicio';
+    const docLabel =
+      params.docType === 'OT' ? 'orden de trabajo' : 'orden de servicio';
+    const service = params.service || 'servicio solicitado';
     const message = [
       `${profile.apertura}.`,
-      `Le compartimos el documento ${params.docType} correspondiente al folio ${params.folio}.`,
-      `Servicio: ${params.service || 'N/A'}.`,
-      `Observaciones: ${params.observations || 'Sin observaciones'}.`,
-      `Resumen del documento: ${
-        params.summaryContext?.slice(0, 500) || 'No especificado en documento.'
-      }`,
-      `Esta version corresponde a la cuenta ${params.recipientRole}.`,
-      'Quedamos atentos a su confirmacion.',
+      `Le hacemos llegar la ${docLabel} con la solicitud del servicio ${service}.`,
+      'Quedamos atentos a su ejecucion.',
     ]
       .join(' ')
       .replace(/\s+/g, ' ')
@@ -685,6 +658,37 @@ export class DeepseekMailComposerService {
       'gestionar',
       'atencion',
       'servicio',
+    ];
+    return intents.some((intent) => normalized.includes(intent));
+  }
+
+  private referencesDocumentType(message: string, docType: MailDocType): boolean {
+    const normalized = this.normalizeForComparison(message);
+    if (docType === 'OT') {
+      return (
+        normalized.includes('orden de trabajo') ||
+        /\bot\b/.test(normalized) ||
+        normalized.includes(' orden trabajo')
+      );
+    }
+    return (
+      normalized.includes('orden de servicio') ||
+      /\bos\b/.test(normalized) ||
+      normalized.includes(' orden servicio')
+    );
+  }
+
+  private hasExecutionExpectation(message: string): boolean {
+    const normalized = this.normalizeForComparison(message);
+    const intents = [
+      'ejecucion',
+      'ejecutar',
+      'ejecuten',
+      'realizar',
+      'atencion',
+      'seguimiento',
+      'procedan',
+      'continuen',
     ];
     return intents.some((intent) => normalized.includes(intent));
   }

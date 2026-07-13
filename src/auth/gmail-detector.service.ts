@@ -246,10 +246,30 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      // Hilo de entregables: asunto = solo folio (sin marcador -OS-*).
+      // Si el solicitante responde ahi con el pago (porque los entregables
+      // llegaron antes de contestar la factura -OS-FAC-INT), se reconoce
+      // como la misma transicion de pago del carril (etapas 8/9).
+      let effectiveMarker = route.marker;
+      if (!effectiveMarker) {
+        const pagoMarker = await this.resolvePagoSolicitanteFromEntregablesThread({
+          reply,
+          folio,
+          track,
+        });
+        if (!pagoMarker) {
+          return;
+        }
+        effectiveMarker = pagoMarker;
+        this.logger.log(
+          `[FLOW_ROUTE] folio=${folio} pago de solicitante detectado en hilo de entregables; se aplica marker=${effectiveMarker}`,
+        );
+      }
+
       // Ejecutora puede responder a -OS (factura temprana / entregables) o a
       // -OS-PAGO-INT (ultimo correo de pago) con entregables. Siempre se lee
       // el contenido completo y luego se decide con etapas + clasificacion.
-      if (route.marker === '-OS' || route.marker === '-OS-PAGO-INT') {
+      if (effectiveMarker === '-OS' || effectiveMarker === '-OS-PAGO-INT') {
         const contract = await this.sqlService.getContractByFolio(folio);
         const fromEmail = (reply.fromEmail || '').toLowerCase().trim();
         const ejecutoraEmail = (contract.contrato.email_ejecutora || '').toLowerCase().trim();
@@ -258,7 +278,7 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
           const decision = await this.resolveEjecutoraReplyDecision({
             reply,
             folio,
-            marker: route.marker,
+            marker: effectiveMarker,
             track,
           });
 
@@ -268,7 +288,7 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
               folio,
               track,
               contract,
-              entryMarker: route.marker,
+              entryMarker: effectiveMarker,
             });
             return;
           }
@@ -277,11 +297,11 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
             // Continua al flujo secuencial de factura (-OS → etapas 4/5).
           } else {
             this.logger.warn(
-              `[FLOW_SKIP] folio=${folio} marker=${route.marker} decision=${decision.action} razon="${decision.reason}"`,
+              `[FLOW_SKIP] folio=${folio} marker=${effectiveMarker} decision=${decision.action} razon="${decision.reason}"`,
             );
             return;
           }
-        } else if (route.marker === '-OS-PAGO-INT') {
+        } else if (effectiveMarker === '-OS-PAGO-INT') {
           // -OS-PAGO-INT no tiene transicion de entrada en carril pagos;
           // solo ejecutora puede usarlo (entregables). Otros remitentes: skip.
           this.logger.log(
@@ -291,10 +311,10 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         }
       }
 
-      const transition = this.getTransitionByMarker(route.marker);
+      const transition = this.getTransitionByMarker(effectiveMarker);
       if (!transition) {
         this.logger.log(
-          `[FLOW_SKIP] folio=${folio} marker=${route.marker} sin transicion configurada.`,
+          `[FLOW_SKIP] folio=${folio} marker=${effectiveMarker} sin transicion configurada.`,
         );
         return;
       }
@@ -912,7 +932,13 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private resolveRouteFromSubject(subject: string): { folio: string; marker: string } | null {
+  /**
+   * Asunto con marcador (-OS, -OS-FAC-INT, ...) o solo folio (reenvios de entregables).
+   * marker=null = hilo de entregables / sin sufijo controlado.
+   */
+  private resolveRouteFromSubject(
+    subject: string,
+  ): { folio: string; marker: string | null } | null {
     const source = String(subject || '').toUpperCase();
     const folioMatch = source.match(/\b(\d{2}-[A-Z0-9]{3}-[A-Z0-9]{3}-[A-Z0-9]{5,6}-\d{5})\b/);
     const folio = folioMatch?.[1] ?? '';
@@ -927,11 +953,79 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
       '-OS-FAC-EJ',
       '-OS',
     ];
-    const marker = markers.find((candidate) => source.includes(`${folio}${candidate}`));
-    if (!marker) {
+    const marker =
+      markers.find((candidate) => source.includes(`${folio}${candidate}`)) ?? null;
+    return { folio, marker };
+  }
+
+  /**
+   * Si el solicitante responde al correo de entregables (asunto = solo folio)
+   * con el comprobante de pago, y el carril de pagos esta en etapa 7
+   * (factura integradora ya enviada a solicitante), se trata como -OS-FAC-INT.
+   */
+  private async resolvePagoSolicitanteFromEntregablesThread(params: {
+    reply: {
+      messageId: string;
+      threadId: string;
+      fromEmail: string;
+      subject: string;
+    };
+    folio: string;
+    track: Awaited<ReturnType<SqlService['getContractTrackStatus']>>;
+  }): Promise<'-OS-FAC-INT' | null> {
+    const { reply, folio, track } = params;
+
+    if (track.paymentTrackLatest !== 7) {
+      this.logger.log(
+        `[FLOW_SKIP] folio=${folio} asunto solo-folio; carril pagos=${track.paymentTrackLatest} (se requiere 7 para pago de solicitante).`,
+      );
       return null;
     }
-    return { folio, marker };
+
+    const contract = await this.sqlService.getContractByFolio(folio);
+    const fromEmail = (reply.fromEmail || '').toLowerCase().trim();
+    const solicitanteEmail = this.getEmailByRole(contract, 'solicitante');
+    if (!solicitanteEmail || fromEmail !== solicitanteEmail) {
+      this.logger.log(
+        `[FLOW_SKIP] folio=${folio} asunto solo-folio; remitente no es solicitante.`,
+      );
+      return null;
+    }
+
+    const attachments = await this.gmailOAuthService.getMessageAttachments(reply.messageId);
+    if (!attachments.length) {
+      await this.sendMissingAttachmentsNotice({
+        to: reply.fromEmail,
+        subject: reply.subject,
+        folio,
+        expectedType: 'pago_solicitante',
+      });
+      this.logger.warn(
+        `[FLOW_SKIP] folio=${folio} pago en hilo entregables sin adjuntos.`,
+      );
+      return null;
+    }
+
+    const context = await this.gmailOAuthService.getMessageContext(reply.messageId);
+    const classification = await this.deliverableClassifier.classifyContent({
+      folio,
+      subject: reply.subject,
+      bodyText: context.textBody || context.snippet || '',
+      attachments,
+    });
+
+    this.logger.log(
+      `[CONTENT_IA] folio=${folio} marker=FOLIO_ONLY tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
+    );
+
+    if (classification.tipo !== 'pago') {
+      this.logger.log(
+        `[FLOW_SKIP] folio=${folio} asunto solo-folio de solicitante; contenido=${classification.tipo} (se esperaba pago).`,
+      );
+      return null;
+    }
+
+    return '-OS-FAC-INT';
   }
 
   private getTransitionByMarker(marker: string):

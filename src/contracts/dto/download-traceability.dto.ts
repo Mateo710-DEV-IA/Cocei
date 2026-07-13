@@ -1,5 +1,12 @@
 import { IsArray, IsOptional, IsString } from 'class-validator';
 
+/**
+ * Contratos aceptados por el endpoint (parseo manual en ContractsActionsService):
+ * - [{ folio_digital: "..." }, ...]
+ * - { folio_digital: "..." }
+ * - { folios: ["...", ...] }
+ * - { folios: [{ folio_digital: "..." }, ...] }
+ */
 export class DownloadTraceabilityDto {
   @IsOptional()
   @IsString()
@@ -7,6 +14,5 @@ export class DownloadTraceabilityDto {
 
   @IsOptional()
   @IsArray()
-  @IsString({ each: true })
-  folios?: string[];
+  folios?: Array<string | { folio_digital: string }>;
 }

@@ -304,7 +304,7 @@ export class ContractProcessService {
     const composedMail = await this.deepseekComposer.compose({
       docType: params.docType,
       folio: params.data.contrato.folio_digital,
-      service: params.serviceFocus,
+      service: params.data.contrato.nom_servicio || params.serviceFocus,
       observations: params.data.contrato.detalle_servicio,
       summaryContext: params.intelligentSummary,
       sourceExcerpt: params.sourceExcerpt,
