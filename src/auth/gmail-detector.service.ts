@@ -1032,48 +1032,38 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
 
-    const context = await this.gmailOAuthService.getMessageContext(reply.messageId);
-    const classification = await this.deliverableClassifier.classifyContent({
-      folio,
-      subject: reply.subject,
-      bodyText: context.textBody || context.snippet || '',
-      attachments,
-    });
-
-    this.logger.log(
-      `[CONTENT_IA] folio=${folio} marker=${params.routeMarker || 'ET/LEGACY'} tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
-    );
-
-    if (classification.tipo !== 'pago') {
-      await this.sendSolicitantePagoRetryNotice({
-        to: reply.fromEmail,
-        subject: anchorSubject,
+    // En este hilo el solicitante SOLO paga. No bloqueamos por OCR/IA:
+    // si hay adjuntos + etapa 7 + remitente correcto, se registra el pago
+    // igual que en -OS-FAC-INT. La clasificacion queda solo para logs.
+    try {
+      const context = await this.gmailOAuthService.getMessageContext(reply.messageId);
+      const classification = await this.deliverableClassifier.classifyContent({
         folio,
-        reason: 'no_detectado_pago',
-        attachments: attachments.map((attachment) => ({
-          filename: attachment.filename || 'adjunto',
-          mimeType: attachment.mimeType || 'application/octet-stream',
-          buffer: attachment.buffer,
-        })),
+        subject: reply.subject,
+        bodyText: context.textBody || context.snippet || '',
+        attachments,
       });
-      this.logger.warn(
-        `[FLOW_SKIP] folio=${folio} hilo entregables de solicitante; contenido=${classification.tipo} (se esperaba pago); se solicito reenvio en ${anchorSubject}.`,
+      this.logger.log(
+        `[CONTENT_IA] folio=${folio} marker=${params.routeMarker || 'ET/LEGACY'} tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}" (informativo; no bloquea pago solicitante)`,
       );
-      return null;
+    } catch (error) {
+      this.logger.warn(
+        `[CONTENT_IA] folio=${folio} clasificacion informativa fallo: ${(error as Error).message}`,
+      );
     }
 
     return '-OS-FAC-INT';
   }
 
   /**
-   * Aviso al solicitante cuando en el ancla de entregables no trae pago utilizable.
+   * Aviso al solicitante cuando en el ancla de entregables falta adjunto de pago.
    * Conserva el mismo asunto para que pueda responder al aviso o al correo previo.
    */
   private async sendSolicitantePagoRetryNotice(params: {
     to: string;
     subject: string;
     folio: string;
-    reason: 'sin_adjuntos' | 'no_detectado_pago';
+    reason: 'sin_adjuntos';
     attachments: Array<{ filename: string; mimeType: string; buffer: Buffer }>;
   }): Promise<void> {
     const to = String(params.to || '').trim().toLowerCase();
@@ -1081,26 +1071,14 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const message =
-      params.reason === 'sin_adjuntos'
-        ? `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no contiene adjuntos. En este punto se espera su comprobante de pago. Por favor responda este mismo correo (o el anterior de entregables) adjuntando el comprobante de pago para continuar.`
-        : `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no pudimos identificar los adjuntos como comprobante de pago. Devolvemos lo recibido. Por favor responda este mismo correo (o el anterior de entregables) con el comprobante de pago requerido para continuar.`;
+    const message = `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no contiene adjuntos. En este punto se espera su comprobante de pago. Por favor responda este mismo correo (o el anterior de entregables) adjuntando el comprobante de pago para continuar.`;
 
     try {
-      if (params.attachments.length) {
-        await this.gmailOAuthService.sendMailWithAttachments({
-          to,
-          subject: params.subject,
-          message,
-          attachments: params.attachments,
-        });
-      } else {
-        await this.gmailOAuthService.sendMail({
-          to,
-          subject: params.subject,
-          message,
-        });
-      }
+      await this.gmailOAuthService.sendMail({
+        to,
+        subject: params.subject,
+        message,
+      });
     } catch (error) {
       this.logger.warn(
         `[FLOW_WARN] no se pudo solicitar reenvio de pago a solicitante ${to}: ${(error as Error).message}`,
