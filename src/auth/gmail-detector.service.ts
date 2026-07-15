@@ -412,6 +412,31 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const expectedTipo = this.resolveExpectedContentTipo(transition.attachmentBaseName);
+      if (expectedTipo) {
+        const classification = await this.deliverableClassifier.classifyContent({
+          folio,
+          subject: reply.subject,
+          bodyText: context.textBody || context.snippet || '',
+          attachments,
+        });
+        this.logger.log(
+          `[CONTENT_IA] folio=${folio} marker=${transition.incomingMarker} esperado=${expectedTipo} tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
+        );
+        if (classification.tipo !== expectedTipo) {
+          await this.sendContentMismatchNotice({
+            to: reply.fromEmail,
+            subject: reply.subject,
+            folio,
+            message: this.buildExpectedContentMismatchMessage(expectedTipo, classification.tipo),
+          });
+          this.logger.warn(
+            `[FLOW_SKIP] folio=${folio} marker=${transition.incomingMarker} contenido=${classification.tipo} se esperaba=${expectedTipo}`,
+          );
+          return;
+        }
+      }
+
       const forwardedAttachments: Array<{
         filename: string;
         mimeType: string;
@@ -1024,7 +1049,6 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         subject: anchorSubject,
         folio,
         reason: 'sin_adjuntos',
-        attachments: [],
       });
       this.logger.warn(
         `[FLOW_SKIP] folio=${folio} pago en hilo entregables sin adjuntos; se solicito reenvio en ${anchorSubject}.`,
@@ -1032,46 +1056,86 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
 
-    // En este hilo el solicitante SOLO paga. No bloqueamos por OCR/IA:
-    // si hay adjuntos + etapa 7 + remitente correcto, se registra el pago
-    // igual que en -OS-FAC-INT. La clasificacion queda solo para logs.
-    try {
-      const context = await this.gmailOAuthService.getMessageContext(reply.messageId);
-      const classification = await this.deliverableClassifier.classifyContent({
+    // Solicitante en -ET: se espera pago. IA/OCR valida; si no es pago, avisamos y no avanzamos.
+    const context = await this.gmailOAuthService.getMessageContext(reply.messageId);
+    const classification = await this.deliverableClassifier.classifyContent({
+      folio,
+      subject: reply.subject,
+      bodyText: context.textBody || context.snippet || '',
+      attachments,
+    });
+    this.logger.log(
+      `[CONTENT_IA] folio=${folio} marker=${params.routeMarker || 'ET/LEGACY'} esperado=pago tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
+    );
+
+    if (classification.tipo !== 'pago') {
+      await this.sendSolicitantePagoRetryNotice({
+        to: reply.fromEmail,
+        subject: anchorSubject,
         folio,
-        subject: reply.subject,
-        bodyText: context.textBody || context.snippet || '',
-        attachments,
+        reason: 'no_detectado_pago',
+        detectedTipo: classification.tipo,
       });
-      this.logger.log(
-        `[CONTENT_IA] folio=${folio} marker=${params.routeMarker || 'ET/LEGACY'} tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}" (informativo; no bloquea pago solicitante)`,
-      );
-    } catch (error) {
       this.logger.warn(
-        `[CONTENT_IA] folio=${folio} clasificacion informativa fallo: ${(error as Error).message}`,
+        `[FLOW_SKIP] folio=${folio} hilo entregables de solicitante; contenido=${classification.tipo} (se esperaba pago); se solicito reenvio en ${anchorSubject}.`,
       );
+      return null;
     }
 
     return '-OS-FAC-INT';
   }
 
+  private resolveExpectedContentTipo(
+    attachmentBaseName:
+      | 'factura_ejecutora'
+      | 'factura_integradora'
+      | 'pago_solicitante'
+      | 'pago_integradora',
+  ): 'factura' | 'pago' | null {
+    if (
+      attachmentBaseName === 'factura_ejecutora' ||
+      attachmentBaseName === 'factura_integradora'
+    ) {
+      return 'factura';
+    }
+    if (
+      attachmentBaseName === 'pago_solicitante' ||
+      attachmentBaseName === 'pago_integradora'
+    ) {
+      return 'pago';
+    }
+    return null;
+  }
+
+  private buildExpectedContentMismatchMessage(
+    expected: 'factura' | 'pago',
+    detected: string,
+  ): string {
+    if (expected === 'factura') {
+      return `Se recibio su respuesta, pero los adjuntos no fueron identificados como factura (se detecto: ${detected}). Por favor reenvie este mismo correo con la factura requerida (PDF y XML si aplica).`;
+    }
+    return `Se recibio su respuesta, pero los adjuntos no fueron identificados como comprobante de pago (se detecto: ${detected}). Por favor reenvie este mismo correo con el comprobante de pago (SPEI, transferencia o captura bancaria).`;
+  }
+
   /**
-   * Aviso al solicitante cuando en el ancla de entregables falta adjunto de pago.
-   * Conserva el mismo asunto para que pueda responder al aviso o al correo previo.
+   * Aviso al solicitante en ancla de entregables cuando falta pago usable.
    */
   private async sendSolicitantePagoRetryNotice(params: {
     to: string;
     subject: string;
     folio: string;
-    reason: 'sin_adjuntos';
-    attachments: Array<{ filename: string; mimeType: string; buffer: Buffer }>;
+    reason: 'sin_adjuntos' | 'no_detectado_pago';
+    detectedTipo?: string;
   }): Promise<void> {
     const to = String(params.to || '').trim().toLowerCase();
     if (!to) {
       return;
     }
 
-    const message = `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no contiene adjuntos. En este punto se espera su comprobante de pago. Por favor responda este mismo correo (o el anterior de entregables) adjuntando el comprobante de pago para continuar.`;
+    const message =
+      params.reason === 'sin_adjuntos'
+        ? `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no contiene adjuntos. En este punto se espera su comprobante de pago. Por favor responda este mismo correo (o el anterior de entregables) adjuntando el comprobante de pago para continuar.`
+        : `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no se identifico como comprobante de pago (detectado: ${params.detectedTipo || 'desconocido'}). Por favor responda este mismo correo (o el anterior de entregables) con el comprobante de pago requerido.`;
 
     try {
       await this.gmailOAuthService.sendMail({

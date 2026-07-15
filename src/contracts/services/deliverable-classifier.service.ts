@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PDFParse } from 'pdf-parse';
+import JSZip from 'jszip';
 
 export type ContentTipo = 'factura' | 'pago' | 'entregable' | 'no_aplica';
 
@@ -42,8 +43,9 @@ type AnthropicContentPart =
 export class DeliverableClassifierService {
   private readonly logger = new Logger(DeliverableClassifierService.name);
   private readonly cursorApiUrl = 'https://api.anthropic.com/v1/messages';
-  private readonly maxAttachments = 8;
-  private readonly maxBytesPerFile = 4.5 * 1024 * 1024;
+  private readonly maxAttachments = 16;
+  private readonly maxBytesPerFile = 8 * 1024 * 1024;
+  private readonly maxExpandedFiles = 24;
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -54,8 +56,12 @@ export class DeliverableClassifierService {
     attachments: AttachmentInput[];
   }): Promise<ContentClassificationResult> {
     const apiKey = this.getAiApiKey();
-    const textContext = await this.buildAttachmentTextContext(params.attachments);
-    const multimodalParts = await this.buildMultimodalParts(params);
+    const expanded = await this.expandAttachments(params.attachments);
+    const textContext = await this.buildAttachmentTextContext(expanded);
+    const multimodalParts = await this.buildMultimodalParts({
+      ...params,
+      attachments: expanded,
+    });
 
     if (apiKey) {
       try {
@@ -63,10 +69,10 @@ export class DeliverableClassifierService {
           apiKey,
           model: this.getModel(),
           systemPrompt:
-            'Eres un clasificador documental para contratos de servicios en Mexico. Primero lees TODO el contenido del correo y adjuntos (texto, PDF, imagenes via OCR/vision). Luego decides. Responde SOLO JSON valido.',
+            'Eres un clasificador documental experto para contratos de servicios en Mexico. Lees PDF (incluye imagenes embebidas), fotos, XML, ZIP descomprimidos y texto. Prioriza el CONTENIDO real del documento, no el nombre del archivo. Responde SOLO JSON valido.',
           userContent: multimodalParts,
-          maxTokens: 500,
-          temperature: 0.1,
+          maxTokens: 600,
+          temperature: 0.05,
         });
         const parsed = this.parseClassificationJson(content, textContext);
         if (parsed) {
@@ -78,13 +84,13 @@ export class DeliverableClassifierService {
           `Clasificacion IA multimodal fallo para folio=${params.folio}: ${message}`,
         );
 
-        // Fallback: reintento solo con texto/extractos (por si el endpoint no acepta document/image).
         try {
           const textOnlyParts: AnthropicContentPart[] = [
             {
               type: 'text',
               text: [
-                'Analiza el correo y el extracto de adjuntos. Clasifica en factura|pago|entregable|no_aplica.',
+                'Analiza el correo y el extracto de adjuntos (incluye contenido de ZIP descomprimido). Clasifica en factura|pago|entregable|no_aplica.',
+                this.buildClassificationRubric(),
                 `Folio: ${params.folio}`,
                 `Asunto: ${params.subject}`,
                 `Cuerpo: ${params.bodyText.slice(0, 1500)}`,
@@ -97,10 +103,10 @@ export class DeliverableClassifierService {
             apiKey,
             model: this.getModel(),
             systemPrompt:
-              'Eres un clasificador documental para contratos de servicios en Mexico. Responde SOLO JSON valido.',
+              'Eres clasificador documental para Mexico. Responde SOLO JSON valido.',
             userContent: textOnlyParts,
-            maxTokens: 500,
-            temperature: 0.1,
+            maxTokens: 600,
+            temperature: 0.05,
           });
           const parsed = this.parseClassificationJson(content, textContext);
           if (parsed) {
@@ -121,7 +127,7 @@ export class DeliverableClassifierService {
       );
     }
 
-    const heuristic = this.classifyWithHeuristics(params.attachments, textContext);
+    const heuristic = this.classifyWithHeuristics(expanded, textContext);
     this.logger.log(
       `[CONTENT_HEURISTIC] folio=${params.folio} tipo=${heuristic.tipo} confianza=${heuristic.confianza}`,
     );
@@ -143,6 +149,109 @@ export class DeliverableClassifierService {
     };
   }
 
+  private buildClassificationRubric(): string {
+    return [
+      'Categorias (elige UNA segun el contenido PRINCIPAL):',
+      '- factura: CFDI, factura fiscal, UUID, RFC emisor/receptor, PDF+XML fiscal, "Tipo de Comprobante", importe con impuestos.',
+      '- pago: SPEI, transferencia, recibo bancario, captura de app bancaria, CLABE, referencia de pago, comprobante de pago (aunque sea foto borrosa).',
+      '- entregable: evidencias de trabajo, fotos de obra/instalacion, actas, reportes, bitacoras, avance, dictamenes tecnicos (NO son pago ni factura).',
+      '- no_aplica: solo texto de cortesia, dudas sin documentos, o contenido inutil.',
+      'Si hay mezclas, elige la categoria del documento operativo principal del correo.',
+    ].join('\n');
+  }
+
+  /** Expande ZIP (carpetas dentro de carpetas) a archivos planos para OCR/IA. */
+  private async expandAttachments(
+    attachments: AttachmentInput[],
+  ): Promise<AttachmentInput[]> {
+    const out: AttachmentInput[] = [];
+
+    const pushExpanded = (item: AttachmentInput) => {
+      if (out.length >= this.maxExpandedFiles) {
+        return;
+      }
+      out.push(item);
+    };
+
+    for (const attachment of attachments) {
+      if (out.length >= this.maxExpandedFiles) {
+        break;
+      }
+      const name = (attachment.filename || '').toLowerCase();
+      const mime = (attachment.mimeType || '').toLowerCase();
+      const isZip =
+        mime.includes('zip') ||
+        name.endsWith('.zip') ||
+        mime === 'application/x-zip-compressed';
+
+      if (!isZip || !attachment.buffer?.length) {
+        pushExpanded(attachment);
+        continue;
+      }
+
+      try {
+        const zip = await JSZip.loadAsync(attachment.buffer);
+        const entries = Object.keys(zip.files);
+        let extracted = 0;
+        for (const entryName of entries) {
+          if (out.length >= this.maxExpandedFiles) {
+            break;
+          }
+          const entry = zip.files[entryName];
+          if (!entry || entry.dir) {
+            continue;
+          }
+          const lower = entryName.toLowerCase();
+          if (lower.includes('__macosx') || lower.endsWith('.ds_store')) {
+            continue;
+          }
+          const buffer = Buffer.from(await entry.async('nodebuffer'));
+          if (!buffer.length) {
+            continue;
+          }
+          pushExpanded({
+            filename: `${attachment.filename || 'paquete.zip'}::${entryName}`,
+            mimeType: this.guessMimeFromName(entryName),
+            buffer,
+          });
+          extracted += 1;
+        }
+        this.logger.log(
+          `[CONTENT_ZIP] origen=${attachment.filename} archivos_extraidos=${extracted}`,
+        );
+        if (extracted === 0) {
+          pushExpanded(attachment);
+        }
+      } catch (error) {
+        this.logger.warn(
+          `[CONTENT_ZIP] no se pudo abrir ${attachment.filename}: ${(error as Error).message}`,
+        );
+        pushExpanded(attachment);
+      }
+    }
+
+    return out.length ? out : attachments;
+  }
+
+  private guessMimeFromName(name: string): string {
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.pdf')) return 'application/pdf';
+    if (lower.endsWith('.xml')) return 'application/xml';
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.txt')) return 'text/plain';
+    if (lower.endsWith('.zip')) return 'application/zip';
+    if (lower.endsWith('.docx')) {
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    }
+    if (lower.endsWith('.xlsx')) {
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    }
+    return 'application/octet-stream';
+  }
+
   private async buildMultimodalParts(params: {
     folio: string;
     subject: string;
@@ -153,21 +262,17 @@ export class DeliverableClassifierService {
       {
         type: 'text',
         text: [
-          'Analiza el correo completo y TODOS los adjuntos (usa OCR/vision en imagenes y PDFs).',
-          'Luego clasifica el contenido principal en UNA categoria:',
-          '- factura: CFDI, factura fiscal PDF+XML, comprobante fiscal',
-          '- pago: SPEI, transferencia, recibo bancario, comprobante de pago',
-          '- entregable: evidencias de trabajo, fotos de instalacion/obra, reportes, actas, PDFs de avance',
-          '- no_aplica: gracias, dudas, texto sin docs utiles, o contenido que no encaja',
+          'Analiza el correo y TODOS los adjuntos (incluye archivos dentro de ZIP y PDF con imagenes). Usa OCR/vision.',
+          this.buildClassificationRubric(),
           '',
           `Folio: ${params.folio}`,
           `Asunto: ${params.subject}`,
           `Cuerpo: ${params.bodyText.slice(0, 1500)}`,
-          `Cantidad de adjuntos: ${params.attachments.length}`,
+          `Cantidad de piezas a revisar: ${params.attachments.length}`,
           '',
           'Responde SOLO JSON:',
-          '{"tipo":"factura"|"pago"|"entregable"|"no_aplica","confianza":0.0-1.0,"razon":"explicacion breve","extracted_summary":"resumen de lo leido en adjuntos"}',
-          'Si hay adjuntos, no uses null. Decide con base en el contenido leido, no solo el nombre del archivo.',
+          '{"tipo":"factura"|"pago"|"entregable"|"no_aplica","confianza":0.0-1.0,"razon":"explicacion breve","extracted_summary":"resumen de lo leido"}',
+          'Decide por contenido leido (incluye texto e imagenes en PDF), no solo por el nombre.',
         ].join('\n'),
       },
     ];
@@ -191,12 +296,11 @@ export class DeliverableClassifierService {
         continue;
       }
 
-      if (mime.startsWith('image/')) {
-        const mediaType = this.normalizeImageMediaType(mime);
-        parts.push({
-          type: 'text',
-          text: `Imagen adjunta: ${name}`,
-        });
+      if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp)$/i.test(name)) {
+        const mediaType = this.normalizeImageMediaType(
+          mime.startsWith('image/') ? mime : this.guessMimeFromName(name),
+        );
+        parts.push({ type: 'text', text: `Imagen adjunta: ${name}` });
         parts.push({
           type: 'image',
           source: {
@@ -211,7 +315,7 @@ export class DeliverableClassifierService {
       if (mime === 'application/pdf' || name.toLowerCase().endsWith('.pdf')) {
         parts.push({
           type: 'text',
-          text: `PDF adjunto: ${name} (leer completo con OCR/vision si aplica)`,
+          text: `PDF adjunto: ${name} (leer texto e imagenes embebidas con OCR/vision)`,
         });
         parts.push({
           type: 'document',
@@ -227,7 +331,7 @@ export class DeliverableClassifierService {
       if (mime.includes('xml') || name.toLowerCase().endsWith('.xml')) {
         parts.push({
           type: 'text',
-          text: `XML adjunto ${name}:\n${buffer.toString('utf8').slice(0, 2000)}`,
+          text: `XML adjunto ${name}:\n${buffer.toString('utf8').slice(0, 3500)}`,
         });
         continue;
       }
@@ -235,18 +339,45 @@ export class DeliverableClassifierService {
       if (mime.startsWith('text/') || name.toLowerCase().endsWith('.txt')) {
         parts.push({
           type: 'text',
-          text: `Texto adjunto ${name}:\n${buffer.toString('utf8').slice(0, 2000)}`,
+          text: `Texto adjunto ${name}:\n${buffer.toString('utf8').slice(0, 3000)}`,
+        });
+        continue;
+      }
+
+      if (name.toLowerCase().endsWith('.docx') || mime.includes('wordprocessingml')) {
+        const docxText = await this.extractDocxText(buffer);
+        parts.push({
+          type: 'text',
+          text: `DOCX ${name} extracto:\n${docxText.slice(0, 3000)}`,
         });
         continue;
       }
 
       parts.push({
         type: 'text',
-        text: `Adjunto ${name} (${mime || 'desconocido'}): binario no tipado para vision; clasificar con el resto del contexto.`,
+        text: `Adjunto ${name} (${mime || 'desconocido'}): binario; clasificar con el resto del contexto.`,
       });
     }
 
     return parts;
+  }
+
+  private async extractDocxText(buffer: Buffer): Promise<string> {
+    try {
+      const zip = await JSZip.loadAsync(buffer);
+      const xml = await zip.file('word/document.xml')?.async('text');
+      if (!xml) {
+        return '[docx sin document.xml]';
+      }
+      return xml
+        .replace(/<w:tab\/>/g, '\t')
+        .replace(/<\/w:p>/g, '\n')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    } catch {
+      return '[docx no legible]';
+    }
   }
 
   private async buildAttachmentTextContext(attachments: AttachmentInput[]): Promise<string> {
@@ -258,10 +389,12 @@ export class DeliverableClassifierService {
 
       if (mime === 'application/pdf' || name.toLowerCase().endsWith('.pdf')) {
         excerpt = await this.extractPdfText(attachment.buffer);
-      } else if (mime.startsWith('image/')) {
+      } else if (mime.startsWith('image/') || /\.(jpe?g|png|gif|webp)$/i.test(name)) {
         excerpt = '[imagen adjunta - requiere vision/OCR]';
       } else if (mime.includes('xml') || name.toLowerCase().endsWith('.xml')) {
-        excerpt = attachment.buffer.toString('utf8').slice(0, 600);
+        excerpt = attachment.buffer.toString('utf8').slice(0, 800);
+      } else if (name.toLowerCase().endsWith('.docx') || mime.includes('wordprocessingml')) {
+        excerpt = await this.extractDocxText(attachment.buffer);
       } else {
         excerpt = `[archivo ${mime || 'desconocido'}]`;
       }
@@ -287,13 +420,15 @@ export class DeliverableClassifierService {
       const parser = new PDFParse({ data: buffer });
       const result = await parser.getText();
       await parser.destroy();
-      return String(result.text || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+      return String(result.text || '').replace(/\s+/g, ' ').trim().slice(0, 2500);
     } catch {
-      return '[pdf sin texto extraible]';
+      return '[pdf sin texto extraible - usar vision del PDF completo]';
     }
   }
 
-  private normalizeImageMediaType(mime: string): 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' {
+  private normalizeImageMediaType(
+    mime: string,
+  ): 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp' {
     if (mime === 'image/png' || mime === 'image/gif' || mime === 'image/webp') {
       return mime;
     }
@@ -319,8 +454,16 @@ export class DeliverableClassifierService {
       'spei',
       'transferencia',
       'comprobante de pago',
+      'comprobante pago',
       'referencia bancaria',
       'clabe',
+      'pago exitoso',
+      'operacion exitosa',
+      'bbva',
+      'banorte',
+      'santander',
+      'hsbc',
+      'stp',
     ];
     const invoiceSignals = [
       'cfdi:comprobante',
@@ -328,6 +471,8 @@ export class DeliverableClassifierService {
       'factura',
       'tipo de comprobante',
       'rfc emisor',
+      'rfc receptor',
+      'timbre fiscal',
     ];
     const deliverableSignals = [
       'entregable',
@@ -337,6 +482,8 @@ export class DeliverableClassifierService {
       'fotograf',
       'reporte',
       'avance',
+      'dictamen',
+      'bitacora',
     ];
 
     if (hasXml && hasPdf) {
@@ -383,19 +530,9 @@ export class DeliverableClassifierService {
       return {
         tipo: 'entregable',
         es_entregable: true,
-        confianza: 0.65,
+        confianza: 0.62,
         razon: 'PDF sin senales fiscales/pago; se trata como entregable por defecto.',
         extractedSummary: attachmentContext.slice(0, 500),
-      };
-    }
-
-    if (!attachments.length) {
-      return {
-        tipo: 'no_aplica',
-        es_entregable: false,
-        confianza: 0.9,
-        razon: 'Sin adjuntos para clasificar.',
-        extractedSummary: '',
       };
     }
 
@@ -450,6 +587,11 @@ export class DeliverableClassifierService {
     if (value === 'factura' || value === 'pago' || value === 'entregable' || value === 'no_aplica') {
       return value;
     }
+    if (value.includes('fact')) return 'factura';
+    if (value.includes('pag') || value.includes('spei') || value.includes('transfer')) {
+      return 'pago';
+    }
+    if (value.includes('entreg') || value.includes('eviden')) return 'entregable';
     if (esEntregable === true) {
       return 'entregable';
     }
@@ -492,42 +634,41 @@ export class DeliverableClassifierService {
     const apiUrl =
       this.configService.get<string>('CURSOR_API_URL', '').trim() || this.cursorApiUrl;
 
-    const res = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': params.apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: params.model,
-        max_tokens: params.maxTokens,
-        temperature: params.temperature,
-        system: params.systemPrompt,
-        messages: [{ role: 'user', content: params.userContent }],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
+    try {
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': params.apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: params.model,
+          max_tokens: params.maxTokens,
+          temperature: params.temperature,
+          system: params.systemPrompt,
+          messages: [{ role: 'user', content: params.userContent }],
+        }),
+        signal: controller.signal,
+      });
 
-    if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(`Cursor/Anthropic HTTP ${res.status}: ${errorText}`);
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`IA HTTP ${res.status}: ${errText.slice(0, 400)}`);
+      }
+
+      const json = (await res.json()) as {
+        content?: Array<{ type?: string; text?: string }>;
+      };
+      return (
+        json.content
+          ?.filter((item) => item.type === 'text')
+          .map((item) => item.text ?? '')
+          .join('\n')
+          .trim() ?? ''
+      );
+    } finally {
+      clearTimeout(timer);
     }
-
-    const json = (await res.json()) as {
-      content?: Array<{ type?: string; text?: string }>;
-    };
-    const text =
-      json.content
-        ?.filter((item) => item.type === 'text')
-        .map((item) => item.text ?? '')
-        .join('\n')
-        .trim() ?? '';
-
-    if (!text) {
-      throw new Error('Respuesta IA vacia');
-    }
-    return text;
   }
 }
