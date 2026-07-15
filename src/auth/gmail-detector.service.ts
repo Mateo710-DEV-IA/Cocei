@@ -246,16 +246,18 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // Hilo de entregables: asunto = solo folio (sin marcador -OS-*).
+      // Hilo de entregables: asunto {folio}-ET (legacy: solo folio).
       // Si el solicitante responde ahi con el pago (porque los entregables
       // llegaron antes de contestar la factura -OS-FAC-INT), se reconoce
       // como la misma transicion de pago del carril (etapas 8/9).
+      // También aplica si responde al aviso de "no detectamos pago" (mismo -ET).
       let effectiveMarker = route.marker;
-      if (!effectiveMarker) {
+      if (!effectiveMarker || effectiveMarker === '-ET') {
         const pagoMarker = await this.resolvePagoSolicitanteFromEntregablesThread({
           reply,
           folio,
           track,
+          routeMarker: effectiveMarker,
         });
         if (!pagoMarker) {
           return;
@@ -829,9 +831,10 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const entregablesSubject = this.buildEntregablesSubject(params.folio);
       const sentIntegradora = await this.gmailOAuthService.sendMailWithAttachments({
         to: integradoraEmail,
-        subject: params.folio,
+        subject: entregablesSubject,
         message: forwardMessage,
         attachments: forwardedAttachments,
       });
@@ -873,7 +876,7 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
 
       const sentSolicitante = await this.gmailOAuthService.sendMailWithAttachments({
         to: solicitanteEmail,
-        subject: params.folio,
+        subject: entregablesSubject,
         message: forwardMessage,
         attachments: forwardedAttachments,
       });
@@ -932,9 +935,27 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Asunto de reenvio de entregables: {folio}-ET */
+  private buildEntregablesSubject(folio: string): string {
+    return `${folio}-ET`;
+  }
+
   /**
-   * Asunto con marcador (-OS, -OS-FAC-INT, ...) o solo folio (reenvios de entregables).
-   * marker=null = hilo de entregables / sin sufijo controlado.
+   * Mantiene la ancla del hilo al que respondio el solicitante:
+   * -ET (nuevo), solo folio (legacy) o el aviso de reintento.
+   */
+  private resolveEntregablesPagoAnchorSubject(replySubject: string, folio: string): string {
+    const source = String(replySubject || '').toUpperCase();
+    if (source.includes(`${folio}-ET`)) {
+      return `${folio}-ET`;
+    }
+    // Correos viejos de entregables salieron solo con el folio.
+    return folio;
+  }
+
+  /**
+   * Asunto con marcador (-OS, -OS-FAC-INT, -ET, ...) o solo folio (legacy entregables).
+   * marker=null = hilo legacy de entregables / sin sufijo controlado.
    */
   private resolveRouteFromSubject(
     subject: string,
@@ -952,6 +973,7 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
       '-OS-FAC-INT',
       '-OS-FAC-EJ',
       '-OS',
+      '-ET',
     ];
     const marker =
       markers.find((candidate) => source.includes(`${folio}${candidate}`)) ?? null;
@@ -959,9 +981,10 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Si el solicitante responde al correo de entregables (asunto = solo folio)
-   * con el comprobante de pago, y el carril de pagos esta en etapa 7
-   * (factura integradora ya enviada a solicitante), se trata como -OS-FAC-INT.
+   * Si el solicitante responde al correo de entregables ({folio}-ET o solo folio)
+   * con el comprobante de pago, y el carril de pagos esta en etapa 7, se trata
+   * como -OS-FAC-INT. Si no hay adjuntos o el OCR/IA no detecta pago, se le
+   * reenvia aviso con el mismo asunto-ancla (y adjuntos recibidos si hubo).
    */
   private async resolvePagoSolicitanteFromEntregablesThread(params: {
     reply: {
@@ -972,12 +995,14 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     };
     folio: string;
     track: Awaited<ReturnType<SqlService['getContractTrackStatus']>>;
+    routeMarker?: string | null;
   }): Promise<'-OS-FAC-INT' | null> {
     const { reply, folio, track } = params;
+    const anchorSubject = this.resolveEntregablesPagoAnchorSubject(reply.subject, folio);
 
     if (track.paymentTrackLatest !== 7) {
       this.logger.log(
-        `[FLOW_SKIP] folio=${folio} asunto solo-folio; carril pagos=${track.paymentTrackLatest} (se requiere 7 para pago de solicitante).`,
+        `[FLOW_SKIP] folio=${folio} hilo entregables (${params.routeMarker || 'LEGACY'}); carril pagos=${track.paymentTrackLatest} (se requiere 7 para pago de solicitante).`,
       );
       return null;
     }
@@ -987,21 +1012,22 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     const solicitanteEmail = this.getEmailByRole(contract, 'solicitante');
     if (!solicitanteEmail || fromEmail !== solicitanteEmail) {
       this.logger.log(
-        `[FLOW_SKIP] folio=${folio} asunto solo-folio; remitente no es solicitante.`,
+        `[FLOW_SKIP] folio=${folio} hilo entregables; remitente no es solicitante.`,
       );
       return null;
     }
 
     const attachments = await this.gmailOAuthService.getMessageAttachments(reply.messageId);
     if (!attachments.length) {
-      await this.sendMissingAttachmentsNotice({
+      await this.sendSolicitantePagoRetryNotice({
         to: reply.fromEmail,
-        subject: reply.subject,
+        subject: anchorSubject,
         folio,
-        expectedType: 'pago_solicitante',
+        reason: 'sin_adjuntos',
+        attachments: [],
       });
       this.logger.warn(
-        `[FLOW_SKIP] folio=${folio} pago en hilo entregables sin adjuntos.`,
+        `[FLOW_SKIP] folio=${folio} pago en hilo entregables sin adjuntos; se solicito reenvio en ${anchorSubject}.`,
       );
       return null;
     }
@@ -1015,17 +1041,71 @@ export class GmailDetectorService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.logger.log(
-      `[CONTENT_IA] folio=${folio} marker=FOLIO_ONLY tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
+      `[CONTENT_IA] folio=${folio} marker=${params.routeMarker || 'ET/LEGACY'} tipo=${classification.tipo} confianza=${classification.confianza} source=${classification.source} razon="${classification.razon}"`,
     );
 
     if (classification.tipo !== 'pago') {
-      this.logger.log(
-        `[FLOW_SKIP] folio=${folio} asunto solo-folio de solicitante; contenido=${classification.tipo} (se esperaba pago).`,
+      await this.sendSolicitantePagoRetryNotice({
+        to: reply.fromEmail,
+        subject: anchorSubject,
+        folio,
+        reason: 'no_detectado_pago',
+        attachments: attachments.map((attachment) => ({
+          filename: attachment.filename || 'adjunto',
+          mimeType: attachment.mimeType || 'application/octet-stream',
+          buffer: attachment.buffer,
+        })),
+      });
+      this.logger.warn(
+        `[FLOW_SKIP] folio=${folio} hilo entregables de solicitante; contenido=${classification.tipo} (se esperaba pago); se solicito reenvio en ${anchorSubject}.`,
       );
       return null;
     }
 
     return '-OS-FAC-INT';
+  }
+
+  /**
+   * Aviso al solicitante cuando en el ancla de entregables no trae pago utilizable.
+   * Conserva el mismo asunto para que pueda responder al aviso o al correo previo.
+   */
+  private async sendSolicitantePagoRetryNotice(params: {
+    to: string;
+    subject: string;
+    folio: string;
+    reason: 'sin_adjuntos' | 'no_detectado_pago';
+    attachments: Array<{ filename: string; mimeType: string; buffer: Buffer }>;
+  }): Promise<void> {
+    const to = String(params.to || '').trim().toLowerCase();
+    if (!to) {
+      return;
+    }
+
+    const message =
+      params.reason === 'sin_adjuntos'
+        ? `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no contiene adjuntos. En este punto se espera su comprobante de pago. Por favor responda este mismo correo (o el anterior de entregables) adjuntando el comprobante de pago para continuar.`
+        : `Se recibio su respuesta en el hilo de entregables del folio ${params.folio}, pero no pudimos identificar los adjuntos como comprobante de pago. Devolvemos lo recibido. Por favor responda este mismo correo (o el anterior de entregables) con el comprobante de pago requerido para continuar.`;
+
+    try {
+      if (params.attachments.length) {
+        await this.gmailOAuthService.sendMailWithAttachments({
+          to,
+          subject: params.subject,
+          message,
+          attachments: params.attachments,
+        });
+      } else {
+        await this.gmailOAuthService.sendMail({
+          to,
+          subject: params.subject,
+          message,
+        });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[FLOW_WARN] no se pudo solicitar reenvio de pago a solicitante ${to}: ${(error as Error).message}`,
+      );
+    }
   }
 
   private getTransitionByMarker(marker: string):
