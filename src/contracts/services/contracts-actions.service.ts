@@ -244,10 +244,10 @@ export class ContractsActionsService {
       this.logger.log(
         `[ENDPOINT_STEP] route=${routeLabel} action=traceability folios=${folios.join(',')}`,
       );
-      const result = await this.processService.buildTraceabilityZipByFolios({
+      const result = await this.processService.buildTraceabilityRarByFolios({
         folios,
       });
-      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Type', 'application/vnd.rar');
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${result.fileName}"`,
@@ -258,9 +258,9 @@ export class ContractsActionsService {
           `[ENDPOINT_WARN] route=${routeLabel} action=traceability missingFolios=${result.missingFolios.join(',')}`,
         );
       }
-      res.status(200).send(result.zipBuffer);
+      res.status(200).send(result.rarBuffer);
       this.logger.log(
-        `[ENDPOINT_OK] route=${routeLabel} action=traceability fileName=${result.fileName} bytes=${result.zipBuffer.length}`,
+        `[ENDPOINT_OK] route=${routeLabel} action=traceability fileName=${result.fileName} bytes=${result.rarBuffer.length}`,
       );
     } catch (error) {
       this.logger.error(
@@ -273,9 +273,11 @@ export class ContractsActionsService {
   /**
    * Acepta:
    * - [{ "folio_digital": "..." }, ...]
+   * - { "body": [{ "folio_digital": "..." }, ...] }
    * - { "folio_digital": "..." }
    * - { "folios": ["...", ...] }
    * - { "folios": [{ "folio_digital": "..." }, ...] }
+   * - JSON string en cualquiera de esos contenedores (PHP form)
    */
   private parseTraceabilityFolios(body: unknown): string[] {
     const collected: string[] = [];
@@ -283,9 +285,18 @@ export class ContractsActionsService {
     const pushFolio = (value: unknown) => {
       if (typeof value === 'string') {
         const trimmed = value.trim();
-        if (trimmed) {
-          collected.push(trimmed);
+        if (!trimmed) {
+          return;
         }
+        if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+          try {
+            this.collectTraceabilityFolios(JSON.parse(trimmed), collected);
+          } catch {
+            collected.push(trimmed);
+          }
+          return;
+        }
+        collected.push(trimmed);
         return;
       }
       if (value && typeof value === 'object' && 'folio_digital' in value) {
@@ -298,20 +309,59 @@ export class ContractsActionsService {
       }
     };
 
-    if (Array.isArray(body)) {
-      for (const item of body) {
-        pushFolio(item);
-      }
-    } else if (body && typeof body === 'object') {
-      const obj = body as Record<string, unknown>;
-      pushFolio(obj.folio_digital);
-      if (Array.isArray(obj.folios)) {
-        for (const item of obj.folios) {
-          pushFolio(item);
+    this.collectTraceabilityFolios(body, collected, pushFolio);
+    return Array.from(new Set(collected.filter(Boolean)));
+  }
+
+  private collectTraceabilityFolios(
+    body: unknown,
+    collected: string[],
+    pushFolio?: (value: unknown) => void,
+  ): void {
+    const push =
+      pushFolio ||
+      ((value: unknown) => {
+        if (typeof value === 'string' && value.trim()) {
+          collected.push(value.trim());
+        } else if (value && typeof value === 'object' && 'folio_digital' in value) {
+          const folio = String(
+            (value as { folio_digital?: unknown }).folio_digital ?? '',
+          ).trim();
+          if (folio) {
+            collected.push(folio);
+          }
         }
-      }
+      });
+
+    if (body == null) {
+      return;
     }
 
-    return Array.from(new Set(collected));
+    if (typeof body === 'string') {
+      push(body);
+      return;
+    }
+
+    if (Array.isArray(body)) {
+      for (const item of body) {
+        push(item);
+      }
+      return;
+    }
+
+    if (typeof body === 'object') {
+      const obj = body as Record<string, unknown>;
+      if ('body' in obj) {
+        this.collectTraceabilityFolios(obj.body, collected, push);
+      }
+      push(obj.folio_digital);
+      if (Array.isArray(obj.folios)) {
+        for (const item of obj.folios) {
+          push(item);
+        }
+      } else if (typeof obj.folios === 'string') {
+        push(obj.folios);
+      }
+    }
   }
 }

@@ -5,6 +5,11 @@ import {
   Logger,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { execFile } from 'child_process';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { promisify } from 'util';
 import {
   ContractData,
   ProcessCancelledResult,
@@ -15,7 +20,8 @@ import { GoogleWorkspaceService } from './google-workspace.service';
 import { SqlService } from './sql.service';
 import { DeepseekMailComposerService } from './deepseek-mail-composer.service';
 import * as ExcelJS from 'exceljs';
-import JSZip from 'jszip';
+
+const execFileAsync = promisify(execFile);
 
 @Injectable()
 export class ContractProcessService {
@@ -196,9 +202,9 @@ export class ContractProcessService {
     };
   }
 
-  async buildTraceabilityZipByFolios(params: {
+  async buildTraceabilityRarByFolios(params: {
     folios: string[];
-  }): Promise<{ fileName: string; zipBuffer: Buffer; missingFolios: string[] }> {
+  }): Promise<{ fileName: string; rarBuffer: Buffer; missingFolios: string[] }> {
     const uniqueFolios = Array.from(
       new Set(
         (params.folios || [])
@@ -211,7 +217,7 @@ export class ContractProcessService {
       throw new BadRequestException('Debes enviar al menos un folio para descarga.');
     }
 
-    const zip = new JSZip();
+    const archiveFiles: Array<{ relativePath: string; buffer: Buffer }> = [];
     const missingFolios: string[] = [];
 
     for (const folio of uniqueFolios) {
@@ -232,33 +238,83 @@ export class ContractProcessService {
           continue;
         }
 
-        for (const item of files) {
-          zip.file(item.relativePath, item.buffer);
-        }
+        archiveFiles.push(...files);
       } catch {
         missingFolios.push(folio);
       }
     }
 
-    const hasFiles = Object.keys(zip.files).length > 0;
-    if (!hasFiles) {
+    if (!archiveFiles.length) {
       throw new BadRequestException(
         'No se encontraron carpetas/archivos de trazabilidad para los folios solicitados.',
       );
     }
 
-    const zipBuffer = await zip.generateAsync({
-      type: 'nodebuffer',
-      compression: 'DEFLATE',
-      compressionOptions: { level: 6 },
-    });
-
+    const rarBuffer = await this.createRarBuffer(archiveFiles);
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     return {
-      fileName: `trazabilidad_folios_${stamp}.zip`,
-      zipBuffer,
+      fileName: `trazabilidad_folios_${stamp}.rar`,
+      rarBuffer,
       missingFolios,
     };
+  }
+
+  /** @deprecated Prefer buildTraceabilityRarByFolios */
+  async buildTraceabilityZipByFolios(params: {
+    folios: string[];
+  }): Promise<{ fileName: string; zipBuffer: Buffer; missingFolios: string[] }> {
+    const result = await this.buildTraceabilityRarByFolios(params);
+    return {
+      fileName: result.fileName,
+      zipBuffer: result.rarBuffer,
+      missingFolios: result.missingFolios,
+    };
+  }
+
+  private async createRarBuffer(
+    files: Array<{ relativePath: string; buffer: Buffer }>,
+  ): Promise<Buffer> {
+    const workDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cocei-trace-'));
+    const rarPath = path.join(os.tmpdir(), `cocei-trace-${Date.now()}.rar`);
+
+    try {
+      for (const file of files) {
+        const safeRelative = String(file.relativePath || '')
+          .replace(/\\/g, '/')
+          .replace(/^\/+/, '');
+        if (!safeRelative || safeRelative.includes('..')) {
+          continue;
+        }
+        const fullPath = path.join(workDir, ...safeRelative.split('/'));
+        await fs.mkdir(path.dirname(fullPath), { recursive: true });
+        await fs.writeFile(fullPath, file.buffer);
+      }
+
+      const rarBin = this.configService.get<string>('RAR_BIN', 'rar').trim() || 'rar';
+      try {
+        await execFileAsync(rarBin, ['a', '-r', '-inul', rarPath, '.'], {
+          cwd: workDir,
+          maxBuffer: 200 * 1024 * 1024,
+        });
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException & { stderr?: string };
+        if (err.code === 'ENOENT') {
+          throw new InternalServerErrorException(
+            'No se pudo generar el RAR: el comando "rar" no esta instalado en el servidor. Instala "rar" o configura RAR_BIN en .env.',
+          );
+        }
+        const detail = String(err.stderr || err.message || error);
+        this.logger.error(`[TRACE_RAR_FAIL] ${detail}`);
+        throw new InternalServerErrorException(
+          `No se pudo generar el archivo RAR de trazabilidad. ${detail.slice(0, 300)}`,
+        );
+      }
+
+      return await fs.readFile(rarPath);
+    } finally {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(rarPath, { force: true }).catch(() => undefined);
+    }
   }
 
   private async generateDocumentFlow(params: {

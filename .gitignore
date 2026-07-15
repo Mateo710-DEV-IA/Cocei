@@ -30,6 +30,7 @@ Thumbs.db
 # Local artifacts
 tmp_*.xlsx
 trazabilidad_*.zip
+trazabilidad_*.rar
 *.eml
 
 # Nest / test
