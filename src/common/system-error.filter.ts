@@ -24,18 +24,21 @@ export class SystemErrorFilter implements ExceptionFilter {
         ? exception.getStatus()
         : HttpStatus.INTERNAL_SERVER_ERROR;
 
-    // Solo notifica fallos reales (4xx/5xx de negocio o no controlados).
-    // 404 de rutas inexistentes tambien se registran para trazabilidad.
+    // Bots/scanners suelen pegar GET a rutas inventadas. No ensuciar tab_errores.
+    const shouldPersistError =
+      status !== HttpStatus.NOT_FOUND && status !== HttpStatus.METHOD_NOT_ALLOWED;
+
     const folio = this.resolveFolio(request, exception);
     const context = `${request.method || 'HTTP'} ${request.url || ''}`.trim();
 
-    await this.systemErrorService.notify({
-      error: exception,
-      folioDigital: folio,
-      context,
-      source: 'http',
-    });
-
+    if (shouldPersistError) {
+      await this.systemErrorService.notify({
+        error: exception,
+        folioDigital: folio,
+        context,
+        source: 'http',
+      });
+    }
     const exceptionResponse =
       exception instanceof HttpException ? exception.getResponse() : null;
     const message =
