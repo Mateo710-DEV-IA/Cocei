@@ -200,10 +200,23 @@ export class ContractsActionsService {
         throw error;
       }
 
+      const motivoCancelacion = this.readMotivoCancelacion(body);
+      if (!motivoCancelacion) {
+        this.logger.warn(
+          `[ENDPOINT_STOP] route=${routeLabel} action=cancel reason=motivo_cancelacion_requerido folio=${folioDigital}`,
+        );
+        throw new BadRequestException(
+          'motivo_cancelacion es requerido para cancelar el proceso.',
+        );
+      }
+
       this.logger.log(
-        `[ENDPOINT_STEP] route=${routeLabel} action=cancel folio=${folioDigital}`,
+        `[ENDPOINT_STEP] route=${routeLabel} action=cancel folio=${folioDigital} motivo_len=${motivoCancelacion.length}`,
       );
-      const result = await this.processService.cancelByFolio(folioDigital);
+      const result = await this.processService.cancelByFolio(
+        folioDigital,
+        motivoCancelacion,
+      );
       this.logger.log(
         `[ENDPOINT_OK] route=${routeLabel} action=cancel folio=${folioDigital}`,
       );
@@ -214,6 +227,22 @@ export class ContractsActionsService {
       );
       throw error;
     }
+  }
+
+  private readMotivoCancelacion(body: Record<string, unknown>): string {
+    const candidates = [
+      body.motivo_cancelacion,
+      body.motivoCancelacion,
+      body.motivo,
+      body.Motivo_Cancelacion,
+    ];
+    for (const candidate of candidates) {
+      const value = String(candidate ?? '').trim();
+      if (value) {
+        return value.slice(0, 500);
+      }
+    }
+    return '';
   }
 
   async downloadTraceability(

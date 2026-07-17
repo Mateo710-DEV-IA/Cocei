@@ -124,14 +124,17 @@ export class ContractProcessService {
 
   async cancelByFolio(
     folioDigital: string,
+    motivoCancelacion = '',
   ): Promise<{
     folio_digital: string;
     id_contrato: number;
     cancelled: true;
     driveFolderId: string;
     bitacora: { fileId: string; name: string; webViewLink: string } | null;
+    motivo_cancelacion: string;
     message: string;
   }> {
+    const motivo = String(motivoCancelacion || '').trim();
     const data = await this.sqlService.getContractByFolio(folioDigital);
     const folderId = this.resolveParentFolderId(data);
     if (!folderId) {
@@ -164,6 +167,7 @@ export class ContractProcessService {
         idEtapa: 16,
         nomDocumento: cancelDocName,
         urlDocumento: cancelDocUrl,
+        motivoCancelacion: motivo,
       });
     }
 
@@ -197,6 +201,7 @@ export class ContractProcessService {
             webViewLink: bitacora.webViewLink,
           }
         : null,
+      motivo_cancelacion: motivo,
       message:
         'Proceso cancelado correctamente. Se actualizo isCancelado=1 y se registraron etapas 15 y 16.',
     };

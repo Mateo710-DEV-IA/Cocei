@@ -262,19 +262,27 @@ export class SqlService {
     idEtapa: number;
     nomDocumento: string;
     urlDocumento: string;
+    motivoCancelacion?: string;
   }): Promise<void> {
     try {
+      // Solo etapa 16 (cancelacion) guarda motivo; el resto queda vacio.
+      const motivo =
+        params.idEtapa === 16
+          ? String(params.motivoCancelacion || '').trim().slice(0, 500)
+          : '';
+
       const pool = await this.getPool();
       await pool
         .request()
         .input('idContrato', mssql.Int, params.idContrato)
         .input('idEtapa', mssql.Int, params.idEtapa)
         .input('nomDocumento', mssql.VarChar(255), params.nomDocumento)
-        .input('urlDocumento', mssql.VarChar(500), params.urlDocumento).query(`
+        .input('urlDocumento', mssql.VarChar(500), params.urlDocumento)
+        .input('motivoCancelacion', mssql.VarChar(500), motivo).query(`
           INSERT INTO tab_contratos_detalle
             (id_contrato, fecha_det, id_etapa, nom_documento, url_documento, motivo_cancelacion, id_sinc, fecha_sinc)
           VALUES
-            (@idContrato, GETDATE(), @idEtapa, @nomDocumento, @urlDocumento, '', 1, GETDATE())
+            (@idContrato, GETDATE(), @idEtapa, @nomDocumento, @urlDocumento, @motivoCancelacion, 1, GETDATE())
         `);
     } catch (error) {
       throw new InternalServerErrorException(
